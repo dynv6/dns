@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"hash"
@@ -13,6 +14,53 @@ import (
 	"strings"
 	"time"
 )
+
+// TsigSecrets resolves TSig names in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
+// and returns the corresponding secret bytes.
+type TsigSecretResolver interface {
+	Resolve(name string) (secret []byte)
+}
+
+// TsigSecretMap offers a map as a simple Tsig secret provider.
+type TsigSecretMap map[string][]byte
+
+func (m TsigSecretMap) Resolve(name string) []byte {
+	return m[name]
+}
+
+func (m TsigSecretMap) SetBase64Secret(name, secret string) error {
+	s, err := base64.StdEncoding.DecodeString(secret)
+	if err != nil {
+		return err
+	}
+	m[name] = s
+	return nil
+}
+
+// The TsigSecretResolverFunc type is an adapter similar
+// to http.HandlerFunc that allows the use of ordinary
+// functions as TSIG secret resolvers. If f is a function
+// with the appropriate signature, TsigSecretResolverFunc(f)
+// is a TSIG secret resolver that calls f.
+type TsigSecretResolverFunc func(name string) (secret []byte)
+
+// Resolve calls f(name)
+func (f TsigSecretResolverFunc) Resolve(name string) (secret []byte) {
+	return f(name)
+}
+
+func extractTsigSecret(secrets map[string]string, name string) (secret []byte) {
+	s, ok := secrets[name]
+	if !ok {
+		return nil
+	}
+
+	secret, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil
+	}
+	return secret
+}
 
 // HMAC hashing codes. These are transmitted as domain names.
 const (
@@ -106,6 +154,13 @@ func TsigGenerate(m *Msg, secret, requestMAC string, timersOnly bool) ([]byte, s
 	if err != nil {
 		return nil, "", err
 	}
+	return tsigGenerate(m, rawsecret, requestMAC, timersOnly)
+}
+
+func tsigGenerate(m *Msg, rawsecret []byte, requestMAC string, timersOnly bool) ([]byte, string, error) {
+	if m.IsTsig() == nil {
+		panic("dns: TSIG not last RR in additional")
+	}
 
 	rr := m.Extra[len(m.Extra)-1].(*TSIG)
 	m.Extra = m.Extra[0 : len(m.Extra)-1] // kill the TSIG from the msg
@@ -158,15 +213,21 @@ func TsigGenerate(m *Msg, secret, requestMAC string, timersOnly bool) ([]byte, s
 // If the signature does not validate err contains the
 // error, otherwise it is nil.
 func TsigVerify(msg []byte, secret, requestMAC string, timersOnly bool) error {
-	return tsigVerify(msg, secret, requestMAC, timersOnly, uint64(time.Now().Unix()))
-}
-
-// actual implementation of TsigVerify, taking the current time ('now') as a parameter for the convenience of tests.
-func tsigVerify(msg []byte, secret, requestMAC string, timersOnly bool, now uint64) error {
 	rawsecret, err := fromBase64([]byte(secret))
 	if err != nil {
 		return err
 	}
+
+	return tsigVerifyNow(msg, rawsecret, requestMAC, timersOnly)
+}
+
+// tsigVerifyNow passes all arguments to tsigVerify, but adds the current timestamp.
+func tsigVerifyNow(msg, rawsecret []byte, requestMAC string, timersOnly bool) error {
+	return tsigVerify(msg, rawsecret, requestMAC, timersOnly, uint64(time.Now().Unix()))
+}
+
+// actual implementation of TsigVerify, taking the current time ('now') as a parameter for the convenience of tests.
+func tsigVerify(msg, rawsecret []byte, requestMAC string, timersOnly bool, now uint64) error {
 	// Strip the TSIG from the incoming msg
 	stripped, tsig, err := stripTsig(msg)
 	if err != nil {

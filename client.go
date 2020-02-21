@@ -20,9 +20,9 @@ const (
 
 // A Conn represents a connection to a DNS server.
 type Conn struct {
-	net.Conn                         // a net.Conn holding the connection
-	UDPSize        uint16            // minimum receive buffer for UDP messages
-	TsigSecret     map[string]string // secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
+	net.Conn                          // a net.Conn holding the connection
+	UDPSize        uint16             // minimum receive buffer for UDP messages
+	TsigSecrets    TsigSecretResolver // TsigSecrets will be used to resolve the given secret name in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2) into the corresponding secret bytes.
 	tsigRequestMAC string
 }
 
@@ -36,12 +36,18 @@ type Client struct {
 	// WriteTimeout when non-zero. Can be overridden with net.Dialer.Timeout (see Client.ExchangeWithDialer and
 	// Client.Dialer) or context.Context.Deadline (see the deprecated ExchangeContext)
 	Timeout        time.Duration
-	DialTimeout    time.Duration     // net.DialTimeout, defaults to 2 seconds, or net.Dialer.Timeout if expiring earlier - overridden by Timeout when that value is non-zero
-	ReadTimeout    time.Duration     // net.Conn.SetReadTimeout value for connections, defaults to 2 seconds - overridden by Timeout when that value is non-zero
-	WriteTimeout   time.Duration     // net.Conn.SetWriteTimeout value for connections, defaults to 2 seconds - overridden by Timeout when that value is non-zero
-	TsigSecret     map[string]string // secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
-	SingleInflight bool              // if true suppress multiple outstanding queries for the same Qname, Qtype and Qclass
+	DialTimeout    time.Duration // net.DialTimeout, defaults to 2 seconds, or net.Dialer.Timeout if expiring earlier - overridden by Timeout when that value is non-zero
+	ReadTimeout    time.Duration // net.Conn.SetReadTimeout value for connections, defaults to 2 seconds - overridden by Timeout when that value is non-zero
+	WriteTimeout   time.Duration // net.Conn.SetWriteTimeout value for connections, defaults to 2 seconds - overridden by Timeout when that value is non-zero
+	SingleInflight bool          // if true suppress multiple outstanding queries for the same Qname, Qtype and Qclass
 	group          singleflight
+
+	// secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
+	//
+	// Deprecated: Please use TsigSecrets field and the TsigSecretMap container.
+	TsigSecret map[string]string
+	// TsigSecrets will be used to resolve the given secret name in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2) into the corresponding secret bytes.
+	TsigSecrets TsigSecretResolver
 }
 
 // Exchange performs a synchronous UDP query. It sends the message m to the address
@@ -176,7 +182,12 @@ func (c *Client) exchange(m *Msg, co *Conn) (r *Msg, rtt time.Duration, err erro
 		co.UDPSize = c.UDPSize
 	}
 
-	co.TsigSecret = c.TsigSecret
+	co.TsigSecrets = c.TsigSecrets
+	if co.TsigSecrets == nil && c.TsigSecret != nil {
+		co.TsigSecrets = TsigSecretResolverFunc(func(name string) (secret []byte) {
+			return extractTsigSecret(c.TsigSecret, name)
+		})
+	}
 	t := time.Now()
 	// write with the appropriate write timeout
 	co.SetWriteDeadline(t.Add(c.getTimeoutForRequest(c.writeTimeout())))
@@ -212,11 +223,12 @@ func (co *Conn) ReadMsg() (*Msg, error) {
 		return m, err
 	}
 	if t := m.IsTsig(); t != nil {
-		if _, ok := co.TsigSecret[t.Hdr.Name]; !ok {
+		secret := co.TsigSecrets.Resolve(t.Hdr.Name)
+		if secret == nil {
 			return m, ErrSecret
 		}
 		// Need to work on the original message p, as that was used to calculate the tsig.
-		err = TsigVerify(p, co.TsigSecret[t.Hdr.Name], co.tsigRequestMAC, false)
+		err = tsigVerifyNow(p, secret, co.tsigRequestMAC, false)
 	}
 	return m, err
 }
@@ -294,10 +306,11 @@ func (co *Conn) WriteMsg(m *Msg) (err error) {
 	var out []byte
 	if t := m.IsTsig(); t != nil {
 		mac := ""
-		if _, ok := co.TsigSecret[t.Hdr.Name]; !ok {
+		secret := co.TsigSecrets.Resolve(t.Hdr.Name)
+		if secret == nil {
 			return ErrSecret
 		}
-		out, mac, err = TsigGenerate(m, co.TsigSecret[t.Hdr.Name], co.tsigRequestMAC, false)
+		out, mac, err = tsigGenerate(m, secret, co.tsigRequestMAC, false)
 		// Set for the next read, although only used in zone transfers
 		co.tsigRequestMAC = mac
 	} else {

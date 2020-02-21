@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -8,6 +9,14 @@ import (
 	"testing"
 	"time"
 )
+
+func newSecret(s string) []byte {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
 
 func newTsig(algo string) *Msg {
 	m := new(Msg)
@@ -17,12 +26,14 @@ func newTsig(algo string) *Msg {
 }
 
 func TestTsig(t *testing.T) {
+	secret := newSecret("pRZgBrBvI4NAHZYhxmhs/Q==")
+
 	m := newTsig(HmacMD5)
-	buf, _, err := TsigGenerate(m, "pRZgBrBvI4NAHZYhxmhs/Q==", "", false)
+	buf, _, err := tsigGenerate(m, secret, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = TsigVerify(buf, "pRZgBrBvI4NAHZYhxmhs/Q==", "", false)
+	err = tsigVerifyNow(buf, secret, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,25 +41,27 @@ func TestTsig(t *testing.T) {
 	// TSIG accounts for ID substitution. This means if the message ID is
 	// changed by a forwarder, we should still be able to verify the TSIG.
 	m = newTsig(HmacMD5)
-	buf, _, err = TsigGenerate(m, "pRZgBrBvI4NAHZYhxmhs/Q==", "", false)
+	buf, _, err = tsigGenerate(m, secret, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	binary.BigEndian.PutUint16(buf[0:2], 42)
-	err = TsigVerify(buf, "pRZgBrBvI4NAHZYhxmhs/Q==", "", false)
+	err = tsigVerifyNow(buf, secret, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestTsigCase(t *testing.T) {
+	secret := newSecret("pRZgBrBvI4NAHZYhxmhs/Q==")
+
 	m := newTsig("HmAc-mD5.sig-ALg.rEg.int.") // HmacMD5
-	buf, _, err := TsigGenerate(m, "pRZgBrBvI4NAHZYhxmhs/Q==", "", false)
+	buf, _, err := tsigGenerate(m, secret, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = TsigVerify(buf, "pRZgBrBvI4NAHZYhxmhs/Q==", "", false)
+	err = tsigVerifyNow(buf, secret, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,10 +75,12 @@ const (
 		"%012x" + // placeholder for the "time signed" field
 		"012c00208cf23e0081d915478a182edcea7ff48ad102948e6c7ef8e887536957d1fa5616c60000000000"
 	// A secret (in base64 format) with which the TSIG in wireMsg will be validated
-	testSecret        = "NoTCJU+DMqFWywaPyxSijrDEA/eC3nK0xi3AMEZuPVk="
+	testSecret = "NoTCJU+DMqFWywaPyxSijrDEA/eC3nK0xi3AMEZuPVk="
 	// the 'time signed' field value that would make the TSIG RR valid with testSecret
 	timeSigned uint64 = 1594855491
 )
+
+var rawTestSecret = newSecret(testSecret)
 
 func TestTsigErrors(t *testing.T) {
 	// Helper shortcut to build wire-format test message.
@@ -79,23 +94,23 @@ func TestTsigErrors(t *testing.T) {
 	}
 
 	// the signature is valid but 'time signed' is too far from the "current time".
-	if err := tsigVerify(buildMsgData(timeSigned), testSecret, "", false, timeSigned+301); err != ErrTime {
+	if err := tsigVerify(buildMsgData(timeSigned), rawTestSecret, "", false, timeSigned+301); err != ErrTime {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrTime, err)
 	}
-	if err := tsigVerify(buildMsgData(timeSigned), testSecret, "", false, timeSigned-301); err != ErrTime {
+	if err := tsigVerify(buildMsgData(timeSigned), rawTestSecret, "", false, timeSigned-301); err != ErrTime {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrTime, err)
 	}
 
 	// the signature is invalid and 'time signed' is too far.
 	// the signature should be checked first, so we should see ErrSig.
-	if err := tsigVerify(buildMsgData(timeSigned+301), testSecret, "", false, timeSigned); err != ErrSig {
+	if err := tsigVerify(buildMsgData(timeSigned+301), rawTestSecret, "", false, timeSigned); err != ErrSig {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrSig, err)
 	}
 
 	// tweak the algorithm name in the wire data, resulting in the "unknown algorithm" error.
 	msgData := buildMsgData(timeSigned)
 	copy(msgData[67:], "bogus")
-	if err := tsigVerify(msgData, testSecret, "", false, timeSigned); err != ErrKeyAlg {
+	if err := tsigVerify(msgData, rawTestSecret, "", false, timeSigned); err != ErrKeyAlg {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrKeyAlg, err)
 	}
 
@@ -104,7 +119,7 @@ func TestTsigErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tsigVerify(msgData, testSecret, "", false, timeSigned); err != ErrNoSig {
+	if err := tsigVerify(msgData, rawTestSecret, "", false, timeSigned); err != ErrNoSig {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrNoSig, err)
 	}
 
@@ -120,7 +135,7 @@ func TestTsigErrors(t *testing.T) {
 	if msgData, err = msg.Pack(); err != nil {
 		t.Fatal(err)
 	}
-	err = tsigVerify(msgData, testSecret, "", false, timeSigned)
+	err = tsigVerify(msgData, rawTestSecret, "", false, timeSigned)
 	if err == nil || !strings.Contains(err.Error(), "overflow") {
 		t.Errorf("expected error to contain %q, but got %v", "overflow", err)
 	}
@@ -231,7 +246,7 @@ func TestTSIGHMAC224And384(t *testing.T) {
 			if mac != tc.expectedMAC {
 				t.Fatalf("MAC doesn't match: expected '%s' but got '%s'", tc.expectedMAC, mac)
 			}
-			if err = tsigVerify(msgData, tc.secret, "", false, timeSigned); err != nil {
+			if err = tsigVerify(msgData, newSecret(tc.secret), "", false, timeSigned); err != nil {
 				t.Error(err)
 			}
 		})
